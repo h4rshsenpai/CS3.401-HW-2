@@ -42,15 +42,14 @@ python3 check_weather.py test_data.txt \
   --processes 4
 ```
 
-The checker runs the sequential executable once and the MPI executable with the requested process count. It passes only when their output matches, ignoring blank lines and extra whitespace.
+The checker runs the sequential executable once and the MPI executable with the requested process count.
+It passes only when their output matches, ignoring blank lines and extra whitespace.
 
 ## Run
 
 ```bash
 mpirun -np 4 ./weather_report data.txt
 ```
-
-The current implementation has rank 0 read the input and uses `MPI_Scatterv` to distribute `Measurement` structs evenly across ranks. When `N` is not divisible by the process count, the first `N % P` ranks each receive one additional record.
 
 ## Smoke Test
 
@@ -64,52 +63,78 @@ mpirun -np 4 ./weather_report test_data.txt
 After adding the sequential implementation and final report output, run `check_weather.py` with the two executables as shown above.
 
 
+## Implementation Status
 
-## Design Choices and Implementation 
+`weather_report.cpp` is currently an unfinished naive approach: Rank 0 reads the entire input and scatters the records.
+No sequential implementation as of now. The implementation and the sequential reference must be completed before using `check_weather.py`.
 
-#### Trivial Computations (doesn't affect scalability)
+## Design and Complexity Roadmap
 
-- Totals
-- Aggregatess
-- 
+### Stage 1: Naive approach - Centralized reading and reduction
 
-#### Non-trivial Computations
+Rank 0 reads all `N` records and uses `MPI_Scatterv` to distribute contiguous
+groups of `Measurement` values. Each rank computes scalar aggregates and
+maintains two local hashmaps:
 
+1. `station_id -> {count, temperature_sum, rainfall_sum}` for Top-K stations.
+2. `timestamp / 60 -> count` for busiest intervals.
 
-### 1. Naive Approach
-
-Have Rank 0 be the master rank that reads all input and distributes to nodes. Each node calculates its own
-scalar measurements (sum, average, minimum, maximum) and 2 local maps :
-
-1. { count : timestamp } for busiest interval 
-2. { station_id : (temperature, count, rainfall_sum)} for top K station measurements
-
-Reduce scalar values to 0 towards Rank 0. 
-Each node communicates their map to Rank 0 --> Rank 0 merges the maps and prints top K stations and
-busiest interval.
-
-- Centralized approach and easy to implement but Rank 0 becomes a bottleneck on the systems efficiency.
-
-### 2. Distributed I/O + 
-
-Each node reads non-overlapping `N / P` sections. If N is not divisible by P, rank 0 can take that work.
-
-Instead of merging maps, have each node be in charge of one station ID. Once 
-
-Smarter approach would be to have each node keep their own minimum and maximum,
-and shift both towards Rank 0. 
-
-- Top K stations 
-
-**naive approch:** A node must be 
+Scalar values are combined with `MPI_Reduce`. Each rank also provides one local
+hottest and coldest measurement candidate; rank 0 selects the global candidate
+using the required tie rules. The maps are flattened into entry arrays and sent
+to rank 0, which merges and evaluates them.
 
 
-Each node keeps maintains a local copy of top K stations and sends to rank 0 at the end of
-local computations. Rank 0 collates and computes - O(K.P). 
+- Rank-0 input work -> `O(N)`
+- Per-rank local record work -> `O(N / P)`
+- Root-to-rank scatter -> `O(N)`
+- Root map merge -> `O(sum of local unique keys)` -> worst case `O(N)`
+- Root Top-K selection after merge -> `O(S log S)`
 
-Necessarily, if a station is the top K 
-in the entire list, it must also be in the top K of the shelters 
+This version is straightforward but rank 0 will bottleck the system.
 
+### Stage 2: Parallel file reading
 
+Remove the full root-side record vector and `MPI_Scatterv`. Rank 0 reads and
+broadcasts only the header (`N`, `K`, `S`), the byte offset after the header,
+and file size. Each rank reads a non-overlapping byte range of the records
+section from the shared input file.
 
-## Naive approach
+Because input is newline-delimited text, a rank starting inside a line must discard that partial line.
+This ensures each record is processed exactly once. Parsing and record storage become approximately `O(N / P)`
+per rank, with no `O(N)` requirement for root memory and distribution.
+
+### Stage 3: Redistribute and merge partial aggregates
+
+Each rank first combines its own records, but a station or interval may still
+have partial statistics on multiple ranks. Assign every station and interval
+key to one owner rank:
+
+```text
+owner(key) = key % P
+```
+
+Flatten the populated local map entries. First exchange the number of entries
+for each destination using `MPI_Alltoall`, then exchange the entries using
+`MPI_Alltoallv`. Each owner merges the entries it receives and now holds the
+complete statistics for its assigned keys.
+
+Each rank owns about `S / P` stations. Intervals remain sparse because Q8 does
+not bound the timestamp range. This removes the root-side merge of every
+station and interval aggregate.
+
+### Stage 4: Final Gather
+
+Each station owner selects its local Top-K from its complete station statistics.
+Each interval owner selects its one busiest interval. Rank 0 gathers at most
+`K` station candidates and one interval candidate from every rank.
+
+Rank 0 therefore selects the global Top-K from at most `P * K` stations and
+the busiest interval from `P` interval candidates. This is correct because a
+station in the global Top-K must also be in the local Top-K of its owner rank.
+Sorting the gathered station candidates costs `O(P * K * log(P * K))` at rank
+0. For equal busiest counts, ties are deterministic.
+
+Scalar aggregates still use `MPI_Reduce`. Hottest and coldest remain one
+`Measurement` candidate per rank, gathered to rank 0. The root receives only
+these small final candidate sets, rather than every aggregate entry.
