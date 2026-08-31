@@ -1,563 +1,478 @@
-#include <cctype>
-#include <cstddef>
-#include <cstdlib>
-#include <fstream>
-#include <iostream>
-#include <limits>
 #include <mpi.h>
-#include <string>
-#include <unordered_map>
+#include <stdio.h>
+#include <stdlib.h>
 #include <vector>
+#include <unordered_map>
+#include <queue>
 #include <algorithm>
-#include <iomanip>
+#include <math.h>
+#include <climits>
 
-using ll = long long;
+using namespace std;
 
-struct Measurement {
-    ll timestamp;
-    ll stationId;
-    double temp;
-    double humidity;
-    double pressure;
-    double rainfall;
-    double windSpeed;
+#define INF_VAL 1e18
+
+// structs for data and stats
+struct raw_data {
+    long long ts, s_id;
+    double t, h, p, w;
+    long long r;
 };
 
-struct WeatherTotal {
-    double tempSum = 0.0;
-    double humidSum = 0.0;
-    double pressureSum = 0.0;
-    double rainfallSum = 0.0;
-    double windSum = 0.0;
-
-    double tempMax = -std::numeric_limits<double>::infinity();
-    double pressureMax = -std::numeric_limits<double>::infinity();
-    double humidMax = -std::numeric_limits<double>::infinity();
-    double rainfallMax = -std::numeric_limits<double>::infinity();
-    double windMax = -std::numeric_limits<double>::infinity();
-
-    double tempMin = std::numeric_limits<double>::infinity();
-    double pressureMin = std::numeric_limits<double>::infinity();
-    double humidMin = std::numeric_limits<double>::infinity();
-
-    ll extreme_temp_count = 0;
-    ll count = 0;
+struct glob_st {
+    long long cnt = 0, extr = 0;
+    double s_t = 0, s_h = 0, s_p = 0, s_w = 0;
+    long long s_r = 0;
+    double min_t = INF_VAL, max_t = -INF_VAL;
+    double min_h = INF_VAL, max_h = -INF_VAL;
+    double min_p = INF_VAL, max_p = -INF_VAL;
+    double max_w = -INF_VAL;
+    long long max_r = LLONG_MIN;
 };
 
-struct stationStats {
-    ll count = 0;
-    double tempSum = 0.0;
-    double rainSum = 0.0;
+struct st_val { 
+    long long c = 0; 
+    double t_sum = 0.0; 
+    long long r_sum = 0; 
 };
 
-static inline void update_scalars(const Measurement& M, WeatherTotal& W) {
-    ++W.count;
+struct st_packet { 
+    long long id, c; 
+    double t_sum;
+    long long r_sum; 
+};
 
-    if (M.temp >= 40.0 || M.temp <= 0.0)
-        ++W.extreme_temp_count;
+struct int_packet { 
+    long long id, c; 
+};
 
-    W.tempSum += M.temp;
-    W.humidSum += M.humidity;
-    W.pressureSum += M.pressure;
-    W.rainfallSum += M.rainfall;
-    W.windSum += M.windSpeed;
-
-    W.tempMax = std::max(W.tempMax, M.temp);
-    W.humidMax = std::max(W.humidMax, M.humidity);
-    W.pressureMax = std::max(W.pressureMax, M.pressure);
-    W.rainfallMax = std::max(W.rainfallMax, M.rainfall);
-    W.windMax = std::max(W.windMax, M.windSpeed);
-
-    W.tempMin = std::min(W.tempMin, M.temp);
-    W.humidMin = std::min(W.humidMin, M.humidity);
-    W.pressureMin = std::min(W.pressureMin, M.pressure);
-}
-
-static inline bool betterHot(const Measurement& cur, const Measurement& cand) {
-    if (cand.temp != cur.temp) return cand.temp > cur.temp;
-    if (cand.timestamp != cur.timestamp) return cand.timestamp < cur.timestamp;
-    return cand.stationId < cur.stationId;
-}
-
-static inline bool betterCold(const Measurement& cur, const Measurement& cand) {
-    if (cand.temp != cur.temp) return cand.temp < cur.temp;
-    if (cand.timestamp != cur.timestamp) return cand.timestamp < cur.timestamp;
-    return cand.stationId < cur.stationId;
-}
-
-/* ------------------------ Fast text parsing ----------------------------- */
-
-static inline void skip_spaces(const char*& p, const char* end) {
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-        ++p;
-}
-
-static inline bool parse_ll(const char*& p, const char* end, ll& value) {
-    skip_spaces(p, end);
-    if (p >= end) return false;
-
-    bool neg = false;
-    if (*p == '-') {
-        neg = true;
-        ++p;
+// heap comparison logic
+struct cmp_heap {
+    bool operator()(const st_packet& x, const st_packet& y) const {
+        if (x.c != y.c) return x.c > y.c;
+        return x.id < y.id;
     }
+};
 
-    if (p >= end || !std::isdigit(static_cast<unsigned char>(*p)))
-        return false;
+// make sure we dont read partial lines at boundaries
+void align_file_ptrs(MPI_File f, MPI_Offset& ptr, MPI_Offset sz, bool is_start, MPI_Offset d_start) {
+    if (is_start && ptr <= d_start) return;
+    if (!is_start && ptr >= sz) return;
+    
+    MPI_Offset p_len = 4096; 
+    while (1) {
+        MPI_Offset r_start = (ptr - 1 < (is_start ? d_start : 0)) ? (is_start ? d_start : 0) : (ptr - 1);
+        int len = (p_len < sz - r_start) ? p_len : (sz - r_start);
+        if (len <= 0) return;
 
-    ll x = 0;
-    while (p < end && std::isdigit(static_cast<unsigned char>(*p))) {
-        x = x * 10 + (*p - '0');
-        ++p;
-    }
+        vector<char> buf(len);
+        MPI_Status st;
+        MPI_File_read_at(f, r_start, buf.data(), len, MPI_BYTE, &st);
 
-    value = neg ? -x : x;
-    return true;
-}
+        int off = ptr - r_start;
+        if (off > 0 && buf[off - 1] == '\n') return;
 
-static inline bool parse_double(const char*& p, const char* end, double& value) {
-    skip_spaces(p, end);
-    if (p >= end) return false;
-
-    char* next = nullptr;
-    value = std::strtod(p, &next);
-
-    if (next == p || next > end)
-        return false;
-
-    p = next;
-    return true;
-}
-
-static inline bool parse_measurement(const char*& p,
-                                     const char* end,
-                                     Measurement& m) {
-    return parse_ll(p, end, m.timestamp) &&
-           parse_ll(p, end, m.stationId) &&
-           parse_double(p, end, m.temp) &&
-           parse_double(p, end, m.humidity) &&
-           parse_double(p, end, m.pressure) &&
-           parse_double(p, end, m.rainfall) &&
-           parse_double(p, end, m.windSpeed);
-}
-
-
-static MPI_Offset find_header_end(MPI_File file, MPI_Offset fileSize) {
-    const int probeSize = 4096;
-    std::vector<char> buf(probeSize);
-
-    MPI_Status status;
-    int readCount = static_cast<int>(
-        std::min<MPI_Offset>(fileSize, probeSize)
-    );
-
-    if (readCount <= 0)
-        return -1;
-
-    MPI_File_read_at(file, 0, buf.data(), readCount, MPI_BYTE, &status);
-
-    for (int i = 0; i < readCount; ++i) {
-        if (buf[i] == '\n') {
-            return i + 1;
+        for (int i = off; i < len; ++i) {
+            if (buf[i] == '\n') {
+                ptr = r_start + i + 1;
+                return;
+            }
         }
+        if (r_start + len >= sz) { 
+            ptr = sz; 
+            return; 
+        }
+        p_len *= 2; 
     }
-
-    return -1;
 }
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-
-    int rank = 0, P = 1;
+    int rank = 0, sz_comm = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &P);
+    MPI_Comm_size(MPI_COMM_WORLD, &sz_comm);
 
-    const std::string filename = (argc > 1) ? argv[1] : "data.txt";
+    char* fname = (argc > 1) ? argv[1] : (char*)"data.txt";
+    int n = 0, k = 0, s = 0;
 
-    int N = 0, K = 0, S = 0;
-
-    /*
-     * part 1: reading
-     * we only need n,k and s and do not required to read all the measurements here.
-     */
+    // only root reads the first line
     if (rank == 0) {
-        std::ifstream input(filename);
-
-        if (!input) {
-            std::cerr << "Could not open " << filename << '\n';
+        FILE* fp = fopen(fname, "r");
+        if (!fp || fscanf(fp, "%d %d %d", &n, &k, &s) != 3) {
+            printf("file error on root\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-
-        input >> N >> K >> S;
+        fclose(fp);
     }
-
-    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&K, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&S, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-   /*
- * part 2 - file reading
- * 
- * the naive way: rank 0 reads every single record into memory, then blasts them out to workers using mpi_scatterv.
- * the optimized way: every rank opens the file using mpi-io and reads its own specific chunk of bytes directly from the disk.
- */
     
+    // share metadata
+    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&k, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&s, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    MPI_File file;
-    if (MPI_File_open(MPI_COMM_WORLD,
-                      filename.c_str(),
-                      MPI_MODE_RDONLY,
-                      MPI_INFO_NULL,
-                      &file) != MPI_SUCCESS) {
-        if (rank == 0)
-            std::cerr << "MPI_File_open failed\n";
+    if (n <= 0) { 
+        MPI_Finalize(); 
+        return 1; 
+    }
+
+    // read parallel file
+    MPI_File mf;
+    if (MPI_File_open(MPI_COMM_WORLD, fname, MPI_MODE_RDONLY, MPI_INFO_NULL, &mf) != MPI_SUCCESS) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    MPI_Offset fileSize = 0;
-    MPI_File_get_size(file, &fileSize);
+    MPI_Offset fsize = 0;
+    MPI_File_get_size(mf, &fsize);
 
-    MPI_Offset headerEnd = find_header_end(file, fileSize);
-
-    if (headerEnd < 0) {
-        if (rank == 0)
-            std::cerr << "Could not find the end of the header.\n";
-        MPI_File_close(&file);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    const MPI_Offset dataStart = headerEnd;
-    const MPI_Offset dataBytes = fileSize - dataStart;
-
-   
-    MPI_Offset roughStart =
-        dataStart + (dataBytes * rank) / P;
-
-    MPI_Offset roughEnd =
-        (rank == P - 1)
-        ? fileSize
-        : dataStart + (dataBytes * (rank + 1)) / P;
-
-    MPI_Offset start = roughStart;
-
-    if (rank != 0) {
-        char c;
-        MPI_Status status;
-
-        while (start < fileSize) {
-            MPI_File_read_at(file, start, &c, 1, MPI_BYTE, &status);
-            ++start;
-
-            if (c == '\n')
-                break;
+    // skip headers
+    int probe = (4096 < fsize) ? 4096 : fsize;
+    vector<char> head_buf(probe);
+    MPI_Status mpi_st;
+    MPI_File_read_at(mf, 0, head_buf.data(), probe, MPI_BYTE, &mpi_st);
+    
+    MPI_Offset data_start = -1;
+    for (int i = 0; i < probe; ++i) {
+        if (head_buf[i] == '\n') { 
+            data_start = i + 1; 
+            break; 
         }
     }
+    if (data_start < 0) MPI_Abort(MPI_COMM_WORLD, 1);
 
-    
-    MPI_Offset end = roughEnd;
+    // find out what chunk this rank should read
+    MPI_Offset b_start = data_start + ((fsize - data_start) * rank) / sz_comm;
+    MPI_Offset b_end = (rank == sz_comm - 1) ? fsize : data_start + ((fsize - data_start) * (rank + 1)) / sz_comm;
 
-    if (rank != P - 1) {
-        char c;
-        MPI_Status status;
+    align_file_ptrs(mf, b_start, fsize, true, data_start);
+    align_file_ptrs(mf, b_end, fsize, false, data_start);
+    if (b_end < b_start) b_end = b_start;
 
-        while (end < fileSize) {
-            MPI_File_read_at(file, end, &c, 1, MPI_BYTE, &status);
-            ++end;
+    size_t chunk_bytes = b_end - b_start;
+    vector<char> txt(chunk_bytes);
 
-            if (c == '\n')
-                break;
-        }
-    } else {
-        end = fileSize;
+    // load file chunk in memory blocks
+    size_t d = 0;
+    while (d < chunk_bytes) {
+        int amt = (chunk_bytes - d > 67108864) ? 67108864 : (chunk_bytes - d); 
+        MPI_File_read_at(mf, b_start + d, txt.data() + d, amt, MPI_BYTE, &mpi_st);
+        d += amt;
     }
+    MPI_File_close(&mf);
 
-    if (end < start)
-        end = start;
+    // tracker variables
+    glob_st mystat;
+    unordered_map<long long, st_val> st_map;
+    unordered_map<long long, long long> int_map;
 
-    const MPI_Offset localBytes64 = end - start;
+    raw_data h_loc{}, c_loc{};
+    bool got_any = false;
 
-    
-    if (localBytes64 > static_cast<MPI_Offset>(
-            std::numeric_limits<size_t>::max())) {
-        if (rank == 0)
-            std::cerr << "Local chunk is too large for size_t.\n";
+    char* ptr = txt.data();
+    char* eof = ptr + chunk_bytes;
 
-        MPI_File_close(&file);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    const size_t localBytes = static_cast<size_t>(localBytes64);
-    std::vector<char> buffer(localBytes);
-
-    
-    if (localBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        if (rank == 0)
-            std::cerr << "Chunk exceeds traditional MPI count limit. "
-                         "Use chunked MPI-IO for extremely large files.\n";
-
-        MPI_File_close(&file);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    MPI_Status status;
-    if (localBytes > 0) {
-        MPI_File_read_at_all(
-            file,
-            start,
-            buffer.data(),
-            static_cast<int>(localBytes),
-            MPI_BYTE,
-            &status
-        );
-    }
-
-    MPI_File_close(&file);
-
-   /*
- * part 3 - local computations
- * 
- * we just do a single pass over our assigned chunk of text.
- * we intentionally don't create a big vector to hold all the local data.
- * instead, each measurement is parsed, used to update our stats, and immediately thrown away.
- * this shrinks our memory usage way down from o(n) to basically just the size of the text buffer plus the unique stations and time intervals we find.
- */
-
-    WeatherTotal W;
-
-    Measurement localHottest{};
-    Measurement localColdest{};
-    bool haveExtreme = false;
-
-   
-    std::unordered_map<ll, stationStats> localStations;
-    std::unordered_map<ll, ll> localIntervals;
-
-    
-    if (S > 0) {
-        size_t estimatedLocalStations =
-            static_cast<size_t>(S / P) + 16;
-        localStations.reserve(estimatedLocalStations);
-    }
-
-    localIntervals.reserve(1 << 14);
-
-    const char* p = buffer.data();
-    const char* endPtr = buffer.data() + buffer.size();
-
-    while (p < endPtr) {
-       
-        while (p < endPtr &&
-               (*p == '\n' || *p == '\r' ||
-                *p == ' '  || *p == '\t')) {
-            ++p;
-        }
-
-        if (p >= endPtr)
-            break;
-
-        const char* recordStart = p;
-        Measurement M;
-
+    // start parsing
+    while (ptr < eof) {
+        while (ptr < eof && *ptr <= 32) ptr++; 
+        if (ptr >= eof) break;
         
-        if (!parse_measurement(p, endPtr, M)) {
-            p = recordStart;
-            while (p < endPtr && *p != '\n')
-                ++p;
-            if (p < endPtr)
-                ++p;
-            continue;
+        raw_data curr;
+
+        // read timestamp fast
+        int neg = 0;
+        if (*ptr == '-') { neg = 1; ptr++; } else if (*ptr == '+') ptr++;
+        curr.ts = 0;
+        while (ptr < eof && *ptr >= '0' && *ptr <= '9') { 
+            curr.ts = curr.ts * 10 + (*ptr - '0'); 
+            ptr++; 
         }
-
-        update_scalars(M, W);
-
+        if (neg) curr.ts = -curr.ts;
         
-        if (!haveExtreme) {
-            localHottest = M;
-            localColdest = M;
-            haveExtreme = true;
+        while (ptr < eof && *ptr <= 32) ptr++;
+        
+        // read station id fast
+        neg = 0;
+        if (*ptr == '-') { neg = 1; ptr++; } else if (*ptr == '+') ptr++;
+        curr.s_id = 0;
+        while (ptr < eof && *ptr >= '0' && *ptr <= '9') { 
+            curr.s_id = curr.s_id * 10 + (*ptr - '0'); 
+            ptr++; 
+        }
+        if (neg) curr.s_id = -curr.s_id;
+
+        // rely on stdlib for floating point
+        char* tmp = nullptr;
+        curr.t = strtod(ptr, &tmp); ptr = tmp;
+        curr.h = strtod(ptr, &tmp); ptr = tmp;
+        curr.p = strtod(ptr, &tmp); ptr = tmp;
+        
+        // read rain and save as integer to fix float precision diffs in MPI sum
+        double tmp_r = strtod(ptr, &tmp); ptr = tmp;
+        curr.r = llround(tmp_r * 100);
+        
+        curr.w = strtod(ptr, &tmp); ptr = tmp;
+
+        // update local calculations
+        mystat.cnt++;
+        if (curr.t >= 40.0 || curr.t <= 0.0) mystat.extr++;
+        
+        mystat.s_t += curr.t; 
+        mystat.s_h += curr.h; 
+        mystat.s_p += curr.p; 
+        mystat.s_r += curr.r; 
+        mystat.s_w += curr.w;
+        
+        if (curr.t < mystat.min_t) mystat.min_t = curr.t;
+        if (curr.t > mystat.max_t) mystat.max_t = curr.t;
+        if (curr.h < mystat.min_h) mystat.min_h = curr.h;
+        if (curr.h > mystat.max_h) mystat.max_h = curr.h;
+        if (curr.p < mystat.min_p) mystat.min_p = curr.p;
+        if (curr.p > mystat.max_p) mystat.max_p = curr.p;
+        if (curr.r > mystat.max_r) mystat.max_r = curr.r;
+        if (curr.w > mystat.max_w) mystat.max_w = curr.w;
+
+        // track hottest and coldest points
+        if (!got_any) {
+            h_loc = curr; 
+            c_loc = curr; 
+            got_any = true;
         } else {
-            if (betterHot(localHottest, M))
-                localHottest = M;
-
-            if (betterCold(localColdest, M))
-                localColdest = M;
+            bool is_h = (curr.t != h_loc.t) ? (curr.t > h_loc.t) : ((curr.ts != h_loc.ts) ? (curr.ts < h_loc.ts) : (curr.s_id < h_loc.s_id));
+            if (is_h) h_loc = curr;
+            
+            bool is_c = (curr.t != c_loc.t) ? (curr.t < c_loc.t) : ((curr.ts != c_loc.ts) ? (curr.ts < c_loc.ts) : (curr.s_id < c_loc.s_id));
+            if (is_c) c_loc = curr;
         }
 
-        
-        auto& st = localStations[M.stationId];
-        ++st.count;
-        st.tempSum += M.temp;
-        st.rainSum += M.rainfall;
+        st_map[curr.s_id].c++;
+        st_map[curr.s_id].t_sum += curr.t;
+        st_map[curr.s_id].r_sum += curr.r;
+        int_map[curr.ts / 60]++;
 
-        
-        const ll intervalId = M.timestamp / 60;
-        ++localIntervals[intervalId];
-
-        
-        while (p < endPtr && *p != '\n')
-            ++p;
-
-        if (p < endPtr)
-            ++p;
+        while (ptr < eof && *ptr != '\n') ptr++;
+        if (ptr < eof) ptr++;
     }
 
+    // collect double variables for reduction
+    double lsum[4] = { mystat.s_t, mystat.s_h, mystat.s_p, mystat.s_w };
+    double gsum[4] = {0};
+    MPI_Reduce(lsum, gsum, 4, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    // collect integer variables for exact sums without float drift
+    long long lrsum[2] = { mystat.s_r, mystat.extr };
+    long long grsum[2] = {0};
+    MPI_Reduce(lrsum, grsum, 2, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    double lmax[4] = { mystat.max_t, mystat.max_h, mystat.max_p, mystat.max_w };
+    double gmax[4] = {0};
+    MPI_Reduce(lmax, gmax, 4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    long long lrmax = mystat.max_r, grmax = 0;
+    MPI_Reduce(&lrmax, &grmax, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    double lmin[3] = { mystat.min_t, mystat.min_h, mystat.min_p };
+    double gmin[3] = {0};
+    MPI_Reduce(lmin, gmin, 3, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+
+    // custom types to send structs over mpi
+    MPI_Datatype t_data;
+    int bl1[3] = {1, 1, 1};
+    MPI_Aint ol1[3] = { offsetof(raw_data, ts), offsetof(raw_data, s_id), offsetof(raw_data, t) };
+    MPI_Datatype dt1[3] = { MPI_LONG_LONG, MPI_LONG_LONG, MPI_DOUBLE };
+    MPI_Datatype raw1;
+    MPI_Type_create_struct(3, bl1, ol1, dt1, &raw1);
+    MPI_Type_create_resized(raw1, 0, sizeof(raw_data), &t_data);
+    MPI_Type_commit(&t_data); 
+    MPI_Type_free(&raw1);
+
+    MPI_Datatype t_st;
+    int bl2[4] = {1, 1, 1, 1};
+    MPI_Aint ol2[4] = { offsetof(st_packet, id), offsetof(st_packet, c), offsetof(st_packet, t_sum), offsetof(st_packet, r_sum) };
+    MPI_Datatype dt2[4] = { MPI_LONG_LONG, MPI_LONG_LONG, MPI_DOUBLE, MPI_LONG_LONG };
+    MPI_Datatype raw2;
+    MPI_Type_create_struct(4, bl2, ol2, dt2, &raw2);
+    MPI_Type_create_resized(raw2, 0, sizeof(st_packet), &t_st);
+    MPI_Type_commit(&t_st); 
+    MPI_Type_free(&raw2);
+
+    MPI_Datatype t_int;
+    int bl3[2] = {1, 1};
+    MPI_Aint ol3[2] = { offsetof(int_packet, id), offsetof(int_packet, c) };
+    MPI_Datatype dt3[2] = { MPI_LONG_LONG, MPI_LONG_LONG };
+    MPI_Datatype raw3;
+    MPI_Type_create_struct(2, bl3, ol3, dt3, &raw3);
+    MPI_Type_create_resized(raw3, 0, sizeof(int_packet), &t_int);
+    MPI_Type_commit(&t_int); 
+    MPI_Type_free(&raw3);
+
+    // find true hot and cold
+    raw_data hsnd{}, csnd{};
+    hsnd.t = -INF_VAL; csnd.t = INF_VAL;
+    if (got_any) { 
+        hsnd = h_loc; 
+        csnd = c_loc; 
+    }
+
+    vector<raw_data> h_all(rank ? 0 : sz_comm), c_all(rank ? 0 : sz_comm);
+    MPI_Gather(&hsnd, 1, t_data, h_all.data(), 1, t_data, 0, MPI_COMM_WORLD);
+    MPI_Gather(&csnd, 1, t_data, c_all.data(), 1, t_data, 0, MPI_COMM_WORLD);
+
+    // group stations properly across ranks
+    vector<int> sc(sz_comm, 0), rc(sz_comm, 0);
+    for (auto& k : st_map) {
+        long long ow = k.first % sz_comm; 
+        if (ow < 0) ow += sz_comm;
+        sc[ow]++;
+    }
+    MPI_Alltoall(sc.data(), 1, MPI_INT, rc.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+    vector<int> sd(sz_comm, 0), rd(sz_comm, 0);
+    for (int i = 1; i < sz_comm; ++i) {
+        sd[i] = sd[i - 1] + sc[i - 1];
+        rd[i] = rd[i - 1] + rc[i - 1];
+    }
     
+    vector<st_packet> s_pbuf(sd.back() + sc.back()), r_pbuf(rd.back() + rc.back());
+    vector<int> tracker = sd;
+    for (auto& k : st_map) {
+        long long ow = k.first % sz_comm; 
+        if (ow < 0) ow += sz_comm;
+        s_pbuf[tracker[ow]++] = {k.first, k.second.c, k.second.t_sum, k.second.r_sum};
+    }
+    MPI_Alltoallv(s_pbuf.data(), sc.data(), sd.data(), t_st, r_pbuf.data(), rc.data(), rd.data(), t_st, MPI_COMM_WORLD);
 
-    double localSums[5] = {
-        W.tempSum,
-        W.humidSum,
-        W.pressureSum,
-        W.rainfallSum,
-        W.windSum
-    };
-
-    double globalSums[5] = {};
-
-    double localMaxes[5] = {
-        W.tempMax,
-        W.humidMax,
-        W.pressureMax,
-        W.rainfallMax,
-        W.windMax
-    };
-
-    double globalMaxes[5] = {};
-
-    double localMins[3] = {
-        W.tempMin,
-        W.humidMin,
-        W.pressureMin
-    };
-
-    double globalMins[3] = {};
-
-    ll globalExtreme = 0;
-
-    MPI_Reduce(localSums, globalSums, 5,
-               MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-    MPI_Reduce(localMaxes, globalMaxes, 5,
-               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
-    MPI_Reduce(localMins, globalMins, 3,
-               MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-
-    MPI_Reduce(&W.extreme_temp_count, &globalExtreme, 1,
-               MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-
-    /*
-     * Hottest / coldest candidates.
-     * Only P records are communicated.
-     */
-    MPI_Datatype measurementType;
-
-    int blockLengths[3] = {1, 1, 5};
-    MPI_Datatype fieldTypes[3] = {
-        MPI_LONG_LONG,
-        MPI_LONG_LONG,
-        MPI_DOUBLE
-    };
-
-    MPI_Aint offsets[3] = {
-        offsetof(Measurement, timestamp),
-        offsetof(Measurement, stationId),
-        offsetof(Measurement, temp)
-    };
-
-    MPI_Datatype rawMeasurementType;
-
-    MPI_Type_create_struct(
-        3,
-        blockLengths,
-        offsets,
-        fieldTypes,
-        &rawMeasurementType
-    );
-
-    MPI_Type_create_resized(
-        rawMeasurementType,
-        0,
-        sizeof(Measurement),
-        &measurementType
-    );
-
-    MPI_Type_commit(&measurementType);
-    MPI_Type_free(&rawMeasurementType);
-
-    /*
-     * Empty ranks are possible when P > N.
-     * Give them invalid extreme sentinels.
-     */
-    Measurement hotSend{};
-    Measurement coldSend{};
-
-    hotSend.temp = -std::numeric_limits<double>::infinity();
-    coldSend.temp = std::numeric_limits<double>::infinity();
-
-    if (haveExtreme) {
-        hotSend = localHottest;
-        coldSend = localColdest;
+    unordered_map<long long, st_val> merge_st;
+    for (auto& rx : r_pbuf) {
+        merge_st[rx.id].c += rx.c; 
+        merge_st[rx.id].t_sum += rx.t_sum; 
+        merge_st[rx.id].r_sum += rx.r_sum;
     }
 
-    std::vector<Measurement> hottestCandidates;
-    std::vector<Measurement> coldestCandidates;
-
-    if (rank == 0) {
-        hottestCandidates.resize(P);
-        coldestCandidates.resize(P);
+    // group intervals properly
+    fill(sc.begin(), sc.end(), 0);
+    for (auto& k : int_map) {
+        long long ow = k.first % sz_comm; 
+        if (ow < 0) ow += sz_comm;
+        sc[ow]++;
     }
+    MPI_Alltoall(sc.data(), 1, MPI_INT, rc.data(), 1, MPI_INT, MPI_COMM_WORLD);
 
-    MPI_Gather(
-        &hotSend, 1, measurementType,
-        rank == 0 ? hottestCandidates.data() : nullptr,
-        1, measurementType,
-        0, MPI_COMM_WORLD
-    );
-
-    MPI_Gather(
-        &coldSend, 1, measurementType,
-        rank == 0 ? coldestCandidates.data() : nullptr,
-        1, measurementType,
-        0, MPI_COMM_WORLD
-    );
-
-    MPI_Type_free(&measurementType);
-
+    fill(sd.begin(), sd.end(), 0); 
+    fill(rd.begin(), rd.end(), 0);
+    for (int i = 1; i < sz_comm; ++i) {
+        sd[i] = sd[i - 1] + sc[i - 1];
+        rd[i] = rd[i - 1] + rc[i - 1];
+    }
     
+    vector<int_packet> si_pbuf(sd.back() + sc.back()), ri_pbuf(rd.back() + rc.back());
+    tracker = sd;
+    for (auto& k : int_map) {
+        long long ow = k.first % sz_comm; 
+        if (ow < 0) ow += sz_comm;
+        si_pbuf[tracker[ow]++] = {k.first, k.second};
+    }
+    MPI_Alltoallv(si_pbuf.data(), sc.data(), sd.data(), t_int, ri_pbuf.data(), rc.data(), rd.data(), t_int, MPI_COMM_WORLD);
 
+    unordered_map<long long, long long> merge_int;
+    for (auto& rx : ri_pbuf) merge_int[rx.id] += rx.c;
+
+    // compute best stations locally
+    priority_queue<st_packet, vector<st_packet>, cmp_heap> pq;
+    for (auto& kv : merge_st) {
+        pq.push({kv.first, kv.second.c, kv.second.t_sum, kv.second.r_sum});
+        if ((int)pq.size() > k) pq.pop();
+    }
+
+    st_packet junk = {-1, -1, 0, 0};
+    vector<st_packet> loc_pq(k, junk);
+    int p = 0;
+    while (!pq.empty() && p < k) { 
+        loc_pq[p++] = pq.top(); 
+        pq.pop(); 
+    }
+
+    vector<st_packet> all_pq(rank ? 0 : sz_comm * k);
+    MPI_Gather(loc_pq.data(), k, t_st, all_pq.data(), k, t_st, 0, MPI_COMM_WORLD);
+
+    // find highest interval count locally
+    int_packet bst_int = {-1, -1};
+    for (auto& kv : merge_int) {
+        if (kv.second > bst_int.c || (kv.second == bst_int.c && (bst_int.id == -1 || kv.first < bst_int.id))) {
+            bst_int = {kv.first, kv.second};
+        }
+    }
+    vector<int_packet> all_ints(rank ? 0 : sz_comm);
+    MPI_Gather(&bst_int, 1, t_int, all_ints.data(), 1, t_int, 0, MPI_COMM_WORLD);
+
+    // let root finish up
     if (rank == 0) {
-        // Temporary visibility for Parts 1-4 testing.
-        std::cout << "PART_1_3_COMPLETE\n";
-        std::cout << "N " << N << "\n";
-        std::cout << "K " << K << "\n";
-        std::cout << "S " << S << "\n";
-        std::cout << "GLOBAL_COUNT " << N << "\n";
-        std::cout << "GLOBAL_EXTREME_COUNT " << globalExtreme << "\n";
+        raw_data glob_h = h_all[0], glob_c = c_all[0];
+        for (int i = 1; i < sz_comm; ++i) {
+            bool is_h = (h_all[i].t != glob_h.t) ? (h_all[i].t > glob_h.t) : ((h_all[i].ts != glob_h.ts) ? (h_all[i].ts < glob_h.ts) : (h_all[i].s_id < glob_h.s_id));
+            if (is_h) glob_h = h_all[i];
+            
+            bool is_c = (c_all[i].t != glob_c.t) ? (c_all[i].t < glob_c.t) : ((c_all[i].ts != glob_c.ts) ? (c_all[i].ts < glob_c.ts) : (c_all[i].s_id < glob_c.s_id));
+            if (is_c) glob_c = c_all[i];
+        }
 
-        if (!hottestCandidates.empty()) {
-            Measurement gh = hottestCandidates[0];
-            Measurement gc = coldestCandidates[0];
+        // sort final best stations
+        priority_queue<st_packet, vector<st_packet>, cmp_heap> glob_pq;
+        for (auto& r : all_pq) {
+            if (r.id == -1) continue;
+            glob_pq.push(r);
+            if ((int)glob_pq.size() > k) glob_pq.pop();
+        }
+        
+        vector<st_packet> final_k;
+        while (!glob_pq.empty()) { 
+            final_k.push_back(glob_pq.top()); 
+            glob_pq.pop(); 
+        }
+        sort(final_k.begin(), final_k.end(), [](const st_packet& x, const st_packet& y){
+            return x.c != y.c ? x.c > y.c : x.id < y.id;
+        });
 
-            for (int i = 1; i < P; ++i) {
-                if (betterHot(gh, hottestCandidates[i]))
-                    gh = hottestCandidates[i];
-
-                if (betterCold(gc, coldestCandidates[i]))
-                    gc = coldestCandidates[i];
+        long long f_int = -1, f_intc = -1;
+        for (auto& c : all_ints) {
+            if (c.id < 0) continue;
+            if (c.c > f_intc || (c.c == f_intc && (f_int == -1 || c.id < f_int))) {
+                f_int = c.id; 
+                f_intc = c.c;
             }
+        }
 
-            std::cout << "HOTTEST "
-                      << gh.temp << " "
-                      << gh.stationId << " "
-                      << gh.timestamp << "\n";
+        // print outputs directly
+        printf("TOTAL_MEASUREMENTS %d\n", n);
+        printf("AVERAGE_TEMPERATURE %.6f\n", gsum[0] / n);
+        printf("MIN_TEMPERATURE %.6f\n", gmin[0]);
+        printf("MAX_TEMPERATURE %.6f\n", gmax[0]);
+        printf("AVERAGE_HUMIDITY %.6f\n", gsum[1] / n);
+        printf("MIN_HUMIDITY %.6f\n", gmin[1]);
+        printf("MAX_HUMIDITY %.6f\n", gmax[1]);
+        printf("AVERAGE_PRESSURE %.6f\n", gsum[2] / n);
+        printf("MIN_PRESSURE %.6f\n", gmin[2]);
+        printf("MAX_PRESSURE %.6f\n", gmax[2]);
+        
+        // fix the float precision drift by dividing our exact integer sum
+        printf("TOTAL_RAINFALL %.6f\n", (double)grsum[0] / 100.0);
+        printf("MAX_RAINFALL %.6f\n", (double)grmax / 100.0);
+        
+        printf("AVERAGE_WIND_SPEED %.6f\n", gsum[3] / n);
+        printf("MAX_WIND_SPEED %.6f\n", gmax[3]);
+        printf("EXTREME_TEMPERATURE_EVENTS %lld\n", grsum[1]);
+        printf("HOTTEST_MEASUREMENT %.6f %lld %lld\n", glob_h.t, glob_h.s_id, glob_h.ts);
+        printf("COLDEST_MEASUREMENT %.6f %lld %lld\n", glob_c.t, glob_c.s_id, glob_c.ts);
+        printf("BUSIEST_INTERVAL %lld %lld\n", f_int, f_intc);
+        printf("TOP_STATIONS\n");
 
-            std::cout << "COLDEST "
-                      << gc.temp << " "
-                      << gc.stationId << " "
-                      << gc.timestamp << "\n";
+        for (auto& r : final_k) {
+            printf("%lld %lld %.6f %.6f\n", r.id, r.c, r.t_sum / r.c, (double)r.r_sum / 100.0);
         }
     }
 
+    MPI_Type_free(&t_data); 
+    MPI_Type_free(&t_st); 
+    MPI_Type_free(&t_int);
+    
     MPI_Finalize();
     return 0;
 }

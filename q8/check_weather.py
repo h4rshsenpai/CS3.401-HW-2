@@ -29,8 +29,7 @@ def main():
     args = parser.parse_args()
 
     sequential_output = run([args.sequential, args.input])
-    mpi_output = run([args.mpirun, "-np", str(args.processes), args.mpi, args.input])
-
+    mpi_output = run(args.mpirun.split() + ["-np", str(args.processes), args.mpi, args.input]) 
     if normalize(sequential_output) != normalize(mpi_output):
         print("FAIL: sequential and MPI output differ", file=sys.stderr)
         print("\n--- sequential output ---\n" + sequential_output, file=sys.stderr)
